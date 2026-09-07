@@ -2,9 +2,16 @@ import sqlite3
 import uuid
 import hashlib
 import os
+import sys
 from cryptography.fernet import Fernet
 
-MASTER_KEY_FILE = "master.key"
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MASTER_KEY_FILE = os.path.join(BASE_DIR, "master.key")
+DB_FILE = os.path.join(BASE_DIR, "files.db")
 
 def load_master_key():
     if os.path.exists(MASTER_KEY_FILE):
@@ -19,7 +26,7 @@ def load_master_key():
 master_key = load_master_key()
 db_cipher = Fernet(master_key)
 
-conn = sqlite3.connect("files.db")
+conn = sqlite3.connect(DB_FILE)
 cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS files (
@@ -45,38 +52,9 @@ def encrypt_file(filepath):
     cipher = Fernet(file_key)
 
     file_size = os.path.getsize(filepath)
-    random_name = str(uuid.uuid4()) + ".enc"
-    enc_path = os.path.join(os.path.dirname(filepath), random_name)
-
-    encrypted_data = b""
+    data = b""
     done = 0
     with open(filepath, "rb") as f:
-        while chunk := f.read(4096):
-            encrypted_data += cipher.encrypt(chunk)
-            done += len(chunk)
-            show_progress(done, file_size, "Enkripsi")
-
-    with open(enc_path, "wb") as f:
-        f.write(encrypted_data)
-
-    file_hash = sha256_hash(encrypted_data)
-    enc_key = db_cipher.encrypt(file_key).decode()
-
-    cursor.execute("INSERT INTO files (original_name, random_name, filepath, enc_key, file_hash) VALUES (?, ?, ?, ?, ?)",
-                   (os.path.basename(filepath), random_name, enc_path, enc_key, file_hash))
-    conn.commit()
-
-    os.remove(filepath)
-    print(f"\nFile terenkripsi: {enc_path} (original dihapus)")
-
-def encrypt_file(filepath):
-    file_key = Fernet.generate_key()
-    cipher = Fernet(file_key)
-
-    file_size = os.path.getsize(filepath)
-    with open(filepath, "rb") as f:
-        data = b""
-        done = 0
         while chunk := f.read(4096):
             data += chunk
             done += len(chunk)
@@ -110,9 +88,9 @@ def decrypt_file(filepath):
         cipher = Fernet(file_key)
 
         file_size = os.path.getsize(filepath)
+        encrypted_data = b""
+        done = 0
         with open(filepath, "rb") as f:
-            encrypted_data = b""
-            done = 0
             while chunk := f.read(4096):
                 encrypted_data += chunk
                 done += len(chunk)
@@ -120,7 +98,7 @@ def decrypt_file(filepath):
 
         current_hash = sha256_hash(encrypted_data)
         if current_hash != stored_hash:
-            print("\n⚠️ Hash tidak cocok, file mungkin rusak atau dimodifikasi!")
+            print("\nHash tidak cocok, file mungkin rusak atau dimodifikasi!")
             return
 
         decrypted = cipher.decrypt(encrypted_data)
