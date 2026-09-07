@@ -1,9 +1,16 @@
+import os
+import sys
 import sqlite3
 import uuid
 import hashlib
-import os
-import sys
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import *
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+BUFFER = 100 #100mb buffer
+
+import secrets
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -18,13 +25,12 @@ def load_master_key():
         with open(MASTER_KEY_FILE, "rb") as f:
             return f.read()
     else:
-        key = Fernet.generate_key()
+        key = secrets.token_bytes(32)  # 256-bit AES key
         with open(MASTER_KEY_FILE, "wb") as f:
             f.write(key)
         return key
 
 master_key = load_master_key()
-db_cipher = Fernet(master_key)
 
 conn = sqlite3.connect(DB_FILE)
 cursor = conn.cursor()
@@ -34,7 +40,8 @@ CREATE TABLE IF NOT EXISTS files (
     original_name TEXT,
     random_name TEXT,
     filepath TEXT,
-    enc_key TEXT,
+    nonce BLOB,
+    enc_key BLOB,
     file_hash TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 )
@@ -43,73 +50,85 @@ CREATE TABLE IF NOT EXISTS files (
 def sha256_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def show_progress(done, total, prefix="Progress"):
+def show_progress(done, total, prefix="Progress", bar_length=50):
     percent = int((done / total) * 100)
-    print(f"\r{prefix}: {percent}%", end="", flush=True)
+    filled_length = int(bar_length * percent // 100)
+    bar = "#" * filled_length + "." * (bar_length - filled_length)
+    sys.stdout.write(f"\r{prefix}: [{bar}] {percent}%")
+    sys.stdout.flush()
 
-def encrypt_file(filepath):
-    file_key = Fernet.generate_key()
-    cipher = Fernet(file_key)
+def encrypt_file(filepath, buffer_size=BUFFER*1024*1024):
+    file_key = secrets.token_bytes(32)  # AES-256 key
+    nonce = secrets.token_bytes(12)     # GCM nonce
+
+    cipher = Cipher(algorithms.AES(file_key), modes.GCM(nonce), backend=default_backend())
+    encryptor = cipher.encryptor()
 
     file_size = os.path.getsize(filepath)
-    data = b""
-    done = 0
-    with open(filepath, "rb") as f:
-        while chunk := f.read(4096):
-            data += chunk
-            done += len(chunk)
-            show_progress(done, file_size, "Membaca file untuk enkripsi")
-
-    encrypted = cipher.encrypt(data)
-
     random_name = str(uuid.uuid4()) + ".enc"
     enc_path = os.path.join(os.path.dirname(filepath), random_name)
 
-    with open(enc_path, "wb") as f:
-        f.write(encrypted)
+    done = 0
+    with open(filepath, "rb") as fin, open(enc_path, "wb") as fout:
+        fout.write(nonce)
+        while chunk := fin.read(buffer_size):
+            ct = encryptor.update(chunk)
+            fout.write(ct)
+            done += len(chunk)
+            show_progress(done, file_size, "Encryption")
+        fout.write(encryptor.finalize())
+        fout.write(encryptor.tag)
 
-    file_hash = sha256_hash(encrypted)
-    enc_key = db_cipher.encrypt(file_key).decode()
+    with open(enc_path, "rb") as f:
+        encrypted_data = f.read()
+    file_hash = sha256_hash(encrypted_data)
 
-    cursor.execute("INSERT INTO files (original_name, random_name, filepath, enc_key, file_hash) VALUES (?, ?, ?, ?, ?)",
-                   (os.path.basename(filepath), random_name, enc_path, enc_key, file_hash))
+    cursor.execute("INSERT INTO files (original_name, random_name, filepath, nonce, enc_key, file_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                   (os.path.basename(filepath), random_name, enc_path, nonce, file_key, file_hash))
     conn.commit()
 
     os.remove(filepath)
     print(f"\nFile terenkripsi: {enc_path} (original dihapus)")
 
-def decrypt_file(filepath):
+def decrypt_file(filepath, buffer_size=BUFFER*1024*1024):
     random_name = os.path.basename(filepath)
-    cursor.execute("SELECT id, original_name, enc_key, file_hash FROM files WHERE random_name=?", (random_name,))
+    cursor.execute("SELECT id, original_name, nonce, enc_key, file_hash FROM files WHERE random_name=?", (random_name,))
     row = cursor.fetchone()
-    if row:
-        db_id, original_name, enc_key, stored_hash = row
-        file_key = db_cipher.decrypt(enc_key.encode())
-        cipher = Fernet(file_key)
-
-        file_size = os.path.getsize(filepath)
-        encrypted_data = b""
-        done = 0
-        with open(filepath, "rb") as f:
-            while chunk := f.read(4096):
-                encrypted_data += chunk
-                done += len(chunk)
-                show_progress(done, file_size, "Membaca file untuk dekripsi")
-
-        current_hash = sha256_hash(encrypted_data)
-        if current_hash != stored_hash:
-            print("\nHash tidak cocok, file mungkin rusak atau dimodifikasi!")
-            return
-
-        decrypted = cipher.decrypt(encrypted_data)
-
-        orig_path = os.path.join(os.path.dirname(filepath), original_name)
-        with open(orig_path, "wb") as f:
-            f.write(decrypted)
-
-        os.remove(filepath)
-        cursor.execute("DELETE FROM files WHERE id=?", (db_id,))
-        conn.commit()
-        print(f"\nFile didekripsi: {orig_path} (file .enc & entry DB dihapus)")
-    else:
+    if not row:
         print("Key tidak ditemukan di database!")
+        return
+
+    db_id, original_name, nonce, file_key, stored_hash = row
+
+    file_size = os.path.getsize(filepath)
+    with open(filepath, "rb") as fin:
+        file_data = fin.read()
+    current_hash = sha256_hash(file_data)
+    if current_hash != stored_hash:
+        print("\nHash tidak cocok, file mungkin rusak atau dimodifikasi!")
+        return
+
+    nonce = file_data[:12]
+    tag = file_data[-16:]
+    ciphertext = file_data[12:-16]
+
+    cipher = Cipher(algorithms.AES(file_key), modes.GCM(nonce, tag), backend=default_backend())
+    decryptor = cipher.decryptor()
+
+    done = 0
+    decrypted_data = b""
+    for i in range(0, len(ciphertext), buffer_size):
+        chunk = ciphertext[i:i+buffer_size]
+        decrypted_data += decryptor.update(chunk)
+        done += len(chunk)
+        show_progress(done, len(ciphertext), "Decryption")
+    decrypted_data += decryptor.finalize()
+
+    orig_path = os.path.join(os.path.dirname(filepath), original_name)
+    with open(orig_path, "wb") as fout:
+        fout.write(decrypted_data)
+
+    os.remove(filepath)
+    cursor.execute("DELETE FROM files WHERE id=?", (db_id,))
+    conn.commit()
+    print(f"\nFile didekripsi: {orig_path} (file .enc & entry DB dihapus)")
