@@ -54,7 +54,5 @@
 
 * Opsi master password agar master key lebih terlindungi.
 
-* Progress bar visual [##### ] 50% untuk pengalaman pengguna lebih baik.
-
 ## Author
 * [Reyette](https://github.com/Zeev-x)
