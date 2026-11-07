@@ -4,7 +4,8 @@ import crypto as cr
 
 def usage(script_name):
     print(f"Usage:")
-    print(f"  {script_name} <file_path> [decrypt]       # Encrypt/Decrypt manual")
+    print(f"  {script_name} <path> [decrypt]")
+    print(f"  {script_name} decrypt <path>")
     print("Atau drag & drop banyak file/folder ke script ini.")
     sys.exit(1)
 
@@ -24,10 +25,16 @@ def process_file(file_path, force_decrypt=False):
             print(f"Error saat enkripsi {file_path}: {e}")
 
 def process_folder(folder_path, force_decrypt=False):
-    for root, _, files in os.walk(folder_path):
-        for name in files:
-            file_path = os.path.join(root, name)
-            process_file(file_path, force_decrypt)
+    action = "dekripsi" if force_decrypt else "enkripsi"
+    try:
+        should_decrypt = force_decrypt or cr.is_encrypted_folder(folder_path)
+        if should_decrypt:
+            action = "dekripsi"
+            cr.decrypt_folder(folder_path)
+        else:
+            cr.encrypt_folder(folder_path)
+    except Exception as e:
+        print(f"Error saat {action} folder {folder_path}: {e}")
 
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -36,8 +43,16 @@ if __name__ == "__main__":
     if len(args) == 0:
         usage(script_name)
 
-    # cek apakah mode manual decrypt
-    force_decrypt = (len(args) > 1 and args[1].lower() == "decrypt")
+    force_decrypt = False
+    if len(args) > 1 and args[0].lower() == "decrypt":
+        force_decrypt = True
+        args = args[1:]
+    elif len(args) > 1 and args[-1].lower() == "decrypt":
+        force_decrypt = True
+        args = args[:-1]
+
+    if not args:
+        usage(script_name)
 
     # bisa multiple file/folder
     for path in args:
